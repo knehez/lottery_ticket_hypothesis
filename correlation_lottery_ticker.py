@@ -179,7 +179,16 @@ def lottery_ticket_cycle(device, prune_steps=7, threshold=0.75):
         # Apply cumulative mask BEFORE training
         with torch.no_grad():
             for lname in prunable_layers:
-                getattr(model, lname).weight *= global_masks[lname].to(device)
+                layer = getattr(model, lname)
+                weight_mask = global_masks[lname].to(device)
+                layer.weight *= weight_mask
+
+                # Bias nullázása, ha a súlysor 0
+                bias = layer.bias
+                weight = layer.weight
+                for i in range(weight.shape[0]):
+                    if torch.all(weight[i] == 0):
+                        bias[i] = 0.0
 
         for epoch in range(3):
             train(model, optimizer, train_loader, device)
