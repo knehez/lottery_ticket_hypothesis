@@ -1,3 +1,4 @@
 MNIST/
 tiny-imagenet-200/
 *.pt
+data/
