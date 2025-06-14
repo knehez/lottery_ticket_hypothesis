@@ -50,7 +50,11 @@ def build_fully_pruned_torchscript_model(original_model, fc1_mask, fc2_mask, fc3
     A fc3 rétegben mindig biztosítja, hogy 10 kimeneti neuron (logit) megmaradjon.
     """
     device = next(original_model.parameters()).device
-
+    
+    example_input = torch.rand(1, 1, 28, 28).to(device)
+    traced = torch.jit.trace(original_model, example_input)
+    traced.save("original_model.pt")
+    
     # --- 1. Aktív neuron indexek
     active_fc1_cols = torch.any(fc1_mask != 0, dim=0).nonzero(as_tuple=True)[0]  # bemenet → fc1 input
     active_fc2_cols = torch.any(fc2_mask != 0, dim=0).nonzero(as_tuple=True)[0]  # fc2 input ← fc1 output
@@ -155,7 +159,7 @@ def correlation_mask(weight_tensor: torch.Tensor, global_mask=None, relative_mar
     return full_mask
 
 # ==== 4. LTH ciklus ====
-def lottery_ticket_cycle(device, prune_steps=7, threshold=0.75):
+def lottery_ticket_cycle(device, prune_steps=9):
     transform = transforms.ToTensor()
     train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
     test_dataset = datasets.MNIST('./data', train=False, download=True, transform=transform)

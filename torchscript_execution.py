@@ -21,7 +21,7 @@ def test(model, dataloader, device):
 
 model = torch.jit.load("pruned_model.pt")
 
-device = "cpu" #torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 model.eval()
 
