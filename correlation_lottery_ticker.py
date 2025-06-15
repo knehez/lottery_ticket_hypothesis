@@ -159,7 +159,7 @@ def correlation_mask(weight_tensor: torch.Tensor, global_mask=None, relative_mar
     return full_mask
 
 # ==== 4. LTH ciklus ====
-def lottery_ticket_cycle(device, prune_steps=9):
+def lottery_ticket_cycle(device, prune_steps=7):
     transform = transforms.ToTensor()
     train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
     test_dataset = datasets.MNIST('./data', train=False, download=True, transform=transform)
