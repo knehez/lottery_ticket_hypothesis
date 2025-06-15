@@ -12,9 +12,9 @@ import time
 class MLP(nn.Module):
     def __init__(self):
         super().__init__()
-        self.fc1 = nn.Linear(784, 300)
-        self.fc2 = nn.Linear(300, 100)
-        self.fc3 = nn.Linear(100, 10)
+        self.fc1 = nn.Linear(784, 300, bias=False)
+        self.fc2 = nn.Linear(300, 100, bias=False)
+        self.fc3 = nn.Linear(100, 10, bias=False)
 
     def forward(self, x):
         x = x.view(x.size(0), -1)
@@ -81,9 +81,9 @@ def build_fully_pruned_torchscript_model(original_model, fc1_mask, fc2_mask, fc3
     class PrunedMLP(nn.Module):
         def __init__(self):
             super().__init__()
-            self.fc1 = nn.Linear(in_fc1, out_fc1)
-            self.fc2 = nn.Linear(out_fc1, out_fc2)
-            self.fc3 = nn.Linear(out_fc2, out_fc3)
+            self.fc1 = nn.Linear(in_fc1, out_fc1, bias=False)
+            self.fc2 = nn.Linear(out_fc1, out_fc2, bias=False)
+            self.fc3 = nn.Linear(out_fc2, out_fc3, bias=False)
 
         def forward(self, x):
             x = x.view(x.size(0), -1)
@@ -95,15 +95,12 @@ def build_fully_pruned_torchscript_model(original_model, fc1_mask, fc2_mask, fc3
 
     with torch.no_grad():
         pruned_model.fc1.weight.copy_(original_model.fc1.weight[active_fc1_rows])
-        pruned_model.fc1.bias.copy_(original_model.fc1.bias[active_fc1_rows])
 
         # fc2: csak az aktív output neuronok (sorok) és bemenetek (oszlopok)
         pruned_model.fc2.weight.copy_(original_model.fc2.weight[active_fc2_rows][:, active_fc1_rows])
-        pruned_model.fc2.bias.copy_(original_model.fc2.bias[active_fc2_rows])
 
         # fc3: kimeneti logitek és aktív bemenetek
         pruned_model.fc3.weight.copy_(original_model.fc3.weight[active_fc3_rows][:, active_fc2_rows])
-        pruned_model.fc3.bias.copy_(original_model.fc3.bias[active_fc3_rows])
 
     pruned_model.eval()
 
@@ -159,7 +156,7 @@ def correlation_mask(weight_tensor: torch.Tensor, global_mask=None, relative_mar
     return full_mask
 
 # ==== 4. LTH ciklus ====
-def lottery_ticket_cycle(device, prune_steps=9):
+def lottery_ticket_cycle(device, prune_steps=7):
     transform = transforms.ToTensor()
     train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
     test_dataset = datasets.MNIST('./data', train=False, download=True, transform=transform)
@@ -186,13 +183,6 @@ def lottery_ticket_cycle(device, prune_steps=9):
                 layer = getattr(model, lname)
                 weight_mask = global_masks[lname].to(device)
                 layer.weight *= weight_mask
-
-                # Bias nullázása, ha a súlysor 0
-                bias = layer.bias
-                weight = layer.weight
-                for i in range(weight.shape[0]):
-                    if torch.all(weight[i] == 0):
-                        bias[i] = 0.0
 
         for epoch in range(3):
             train(model, optimizer, train_loader, device)
