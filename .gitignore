@@ -2,3 +2,5 @@ MNIST/
 tiny-imagenet-200/
 *.pt
 data/
+cifar-10-batches-py/
+*.gz
