@@ -158,6 +158,14 @@ def correlation_mask(weight_tensor: torch.Tensor, global_mask=None, relative_mar
 
     return full_mask
 
+def propagate_mask(prev_mask: torch.Tensor, next_weight: torch.Tensor) -> torch.Tensor:
+    row_sums = prev_mask.sum(dim=1)
+    zero_rows = (row_sums == 0).nonzero(as_tuple=False).squeeze()
+    next_mask = torch.ones_like(next_weight)
+    if zero_rows.numel() > 0:
+        next_mask[:, zero_rows] = 0.0
+    return next_mask
+
 # ==== 4. LTH ciklus ====
 def lottery_ticket_cycle(device, prune_steps=7):
     transform = transforms.ToTensor()
@@ -212,13 +220,34 @@ def lottery_ticket_cycle(device, prune_steps=7):
 
         # Create new masks based on current state
         new_masks = {}
-        for lname in prunable_layers:
-            new_masks[lname] = correlation_mask(
-                getattr(model, lname).weight,
-                global_mask=global_masks[lname],
-                relative_margin=0.15,
-                layer_name=lname
-            )
+
+        # fc1 maszkolása önállóan
+        new_masks["fc1"] = correlation_mask(
+            model.fc1.weight,
+            global_mask=global_masks["fc1"],
+            relative_margin=0.15,
+            layer_name="fc1"
+        )
+
+        # fc2 maszkolása, figyelembe véve a fc1 maszkolás hatását
+        fc2_input_mask = propagate_mask(new_masks["fc1"], model.fc2.weight)
+        combined_fc2_mask = global_masks["fc2"] * fc2_input_mask.to(global_masks["fc2"].device)
+        new_masks["fc2"] = correlation_mask(
+            model.fc2.weight,
+            global_mask=combined_fc2_mask,
+            relative_margin=0.15,
+            layer_name="fc2"
+        )
+
+        # fc3 maszkolása, figyelembe véve a fc2 maszkolás hatását
+        fc3_input_mask = propagate_mask(new_masks["fc2"], model.fc3.weight)
+        combined_fc3_mask = global_masks["fc3"] * fc3_input_mask.to(global_masks["fc3"].device)
+        new_masks["fc3"] = correlation_mask(
+            model.fc3.weight,
+            global_mask=combined_fc3_mask,
+            relative_margin=0.15,
+            layer_name="fc3"
+        )
 
         # Update global masks
         for lname in prunable_layers:
