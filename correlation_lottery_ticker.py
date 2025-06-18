@@ -216,6 +216,17 @@ def lottery_ticket_cycle(device, prune_steps=7):
             print(f"Test execution time of original model: {elapsed:.4f} seconds")
             build_fully_pruned_torchscript_model(model, global_masks["fc1"], global_masks["fc2"], global_masks["fc3"], save_path="pruned_model.pt")
             print("Final model saved as 'pruned_model.pt'.")
+            dummy_input = torch.randn(1, 1, 28, 28).to(device)  # MNIST-re például
+            # ONNX exportálás
+            torch.onnx.export(
+                model,
+                dummy_input,
+                "pruned_model.onnx",
+                input_names=["input"],
+                output_names=["output"],
+                dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+                opset_version=11
+            )
             exit()
 
         # Create new masks based on current state

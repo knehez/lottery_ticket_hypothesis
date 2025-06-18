@@ -4,3 +4,5 @@ tiny-imagenet-200/
 data/
 cifar-10-batches-py/
 *.gz
+*.onnx
+*.trt
