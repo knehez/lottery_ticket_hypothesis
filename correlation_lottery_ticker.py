@@ -8,13 +8,13 @@ import copy
 import matplotlib.pyplot as plt
 import time
 
-# ==== 1. Modell ====
+# --- Classic MLP model ---
 class MLP(nn.Module):
-    def __init__(self):
+    def __init__(self, in_features=784, hidden1=300, hidden2=100, out_features=10):
         super().__init__()
-        self.fc1 = nn.Linear(784, 300)
-        self.fc2 = nn.Linear(300, 100)
-        self.fc3 = nn.Linear(100, 10)
+        self.fc1 = nn.Linear(in_features, hidden1)
+        self.fc2 = nn.Linear(hidden1, hidden2)
+        self.fc3 = nn.Linear(hidden2, out_features)
 
     def forward(self, x):
         x = x.view(x.size(0), -1)
@@ -78,20 +78,7 @@ def build_fully_pruned_torchscript_model(original_model, fc1_mask, fc2_mask, fc3
 
     print(f"[Debug] Prunolt modell méretei: fc1: {in_fc1}x{out_fc1}, fc2: {out_fc1}x{out_fc2}, fc3: {out_fc2}x{out_fc3}")
     
-    class PrunedMLP(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.fc1 = nn.Linear(in_fc1, out_fc1)
-            self.fc2 = nn.Linear(out_fc1, out_fc2)
-            self.fc3 = nn.Linear(out_fc2, out_fc3)
-
-        def forward(self, x):
-            x = x.view(x.size(0), -1)
-            x = F.relu(self.fc1(x))
-            x = F.relu(self.fc2(x))
-            return self.fc3(x)
-
-    pruned_model = PrunedMLP().to(device)
+    pruned_model = MLP(in_features=in_fc1, hidden1=out_fc1, hidden2=out_fc2, out_features=out_fc3).to(device)
 
     with torch.no_grad():
         pruned_model.fc1.weight.copy_(original_model.fc1.weight[active_fc1_rows])
@@ -106,7 +93,17 @@ def build_fully_pruned_torchscript_model(original_model, fc1_mask, fc2_mask, fc3
         pruned_model.fc3.bias.copy_(original_model.fc3.bias[active_fc3_rows])
 
     pruned_model.eval()
-
+    dummy_input = torch.randn(1, 1, 28, 28).to(device)  # MNIST-re például
+    # ONNX exportálás
+    torch.onnx.export(
+        pruned_model,
+        dummy_input,
+        "pruned_model.onnx",
+        input_names=["input"],
+        output_names=["output"],
+        dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+        opset_version=20
+    )
     # Export TorchScript
     example_input = torch.rand(1, 1, 28, 28).to(device)
     traced = torch.jit.trace(pruned_model, example_input)
@@ -129,8 +126,8 @@ def correlation_mask(weight_tensor: torch.Tensor, global_mask=None, relative_mar
             print(f"  [Debug] {layer_name}: kevés nem-nulla neuron maradt, nincs értelme korrelációt számolni.")
         return torch.ones_like(weight_tensor)
 
-    W_filtered = W[nonzero_rows]
-    corr_matrix = np.corrcoef(W_filtered)
+    w_filtered = W[nonzero_rows]
+    corr_matrix = np.corrcoef(w_filtered)
     np.fill_diagonal(corr_matrix, 0.0)
 
     max_corr = np.nanmax(np.abs(corr_matrix))
@@ -216,17 +213,6 @@ def lottery_ticket_cycle(device, prune_steps=7):
             print(f"Test execution time of original model: {elapsed:.4f} seconds")
             build_fully_pruned_torchscript_model(model, global_masks["fc1"], global_masks["fc2"], global_masks["fc3"], save_path="pruned_model.pt")
             print("Final model saved as 'pruned_model.pt'.")
-            dummy_input = torch.randn(1, 1, 28, 28).to(device)  # MNIST-re például
-            # ONNX exportálás
-            torch.onnx.export(
-                model,
-                dummy_input,
-                "pruned_model.onnx",
-                input_names=["input"],
-                output_names=["output"],
-                dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
-                opset_version=11
-            )
             exit()
 
         # Create new masks based on current state

@@ -6,3 +6,4 @@ cifar-10-batches-py/
 *.gz
 *.onnx
 *.trt
+__pycache__/
