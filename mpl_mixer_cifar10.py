@@ -80,13 +80,16 @@ def train(model, optimizer, dataloader, device):
 def test(model, dataloader, device):
     model.eval()
     correct = 0
+    total_infer_time = 0.0
     with torch.no_grad():
         for data, target in dataloader:
             data, target = data.to(device), target.to(device)
+            start = time.time()
             output = model(data)
+            total_infer_time += time.time() - start
             pred = output.argmax(dim=1)
             correct += pred.eq(target).sum().item()
-    return correct / len(dataloader.dataset)
+    return correct / len(dataloader.dataset), total_infer_time
 
 
 def correlation_mask(weight_tensor: torch.Tensor, global_mask=None, relative_margin=0.15, verbose=True, layer_name="layer", axis=0):
@@ -315,9 +318,7 @@ def lottery_ticket_mixer_cycle(prune_steps=9, relative_margin=0.15):
 
         for epoch in range(5):
             train(model, optimizer, train_loader, device)
-            start = time.time()
-            acc = test(model, test_loader, device)
-            elapsed = time.time() - start
+            acc, elapsed = test(model, test_loader, device)
             print(f"Epoch {epoch + 1}: accuracy={acc:.4f} - {elapsed:.4f} seconds")
 
         # Mentés az utolsó iterációban
@@ -325,10 +326,7 @@ def lottery_ticket_mixer_cycle(prune_steps=9, relative_margin=0.15):
             torch.save(model.state_dict(), "original_mixer_model.pt")
             print("Final pruned Mixer model saved as 'mixer_pruned_model.pt'")
             pruned_mixer = build_fully_pruned_mixer_model(model, global_masks)
-            start = time.time()
-            acc = test(pruned_mixer, test_loader, device)
-            elapsed = time.time() - start
-
+            acc, elapsed = test(pruned_mixer, test_loader, device)
             print(f"[Eval] pruned modell - Inference time on test set: {elapsed:.4f} seconds - accuracy={acc:.4f}")
             print(pruned_mixer)
             torch.save(pruned_mixer.state_dict(), "pruned_mixer_model.pt")
