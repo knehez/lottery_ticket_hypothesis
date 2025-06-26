@@ -283,12 +283,9 @@ def build_fully_pruned_mixer_model(model, global_masks):
 
     return pruned_mixer
 
-def lottery_ticket_mixer_cycle(device, prune_steps=9, relative_margin=0.15):
+def lottery_ticket_mixer_cycle(prune_steps=9, relative_margin=0.15):
     # --- Data ---
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
-    ])
+    transform = transforms.ToTensor()
     train_loader = DataLoader(datasets.CIFAR10('.', train=True, download=True, transform=transform),
                             batch_size=128, shuffle=True)
     test_loader = DataLoader(datasets.CIFAR10('.', train=False, download=True, transform=transform),
@@ -326,7 +323,7 @@ def lottery_ticket_mixer_cycle(device, prune_steps=9, relative_margin=0.15):
                 block.channel_mlp.fc1.weight *= global_masks[i]['channel_fc1'].to(device)
                 block.channel_mlp.fc2.weight *= global_masks[i]['channel_fc2'].to(device)
 
-        for epoch in range(3):
+        for epoch in range(5):
             train(model, train_loader, optimizer)
             start = time.time()
             acc = test(model, test_loader)
