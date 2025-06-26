@@ -261,7 +261,7 @@ def build_fully_pruned_mixer_model(model, global_masks):
 
     # === Új modell összeállítása ===
     pruned_mixer = MLPMixer(
-        image_size=int(model.patch_size * (model.mixer_blocks[0].token_mlp.fc1.in_features) ** 0.5),
+        image_size=32,  # CIFAR-10 méret
         patch_size=model.patch_size,
         dim=model.embedding.out_features,
         depth=len(new_blocks),
