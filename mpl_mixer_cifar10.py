@@ -5,6 +5,9 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import copy
 from tqdm import trange
+import time
+import numpy as np
+import copy
 
 # --- MLP-Mixer modules ---
 class MLP(nn.Module):
@@ -62,18 +65,6 @@ class MLPMixer(nn.Module):
         x = x.mean(dim=1)
         return self.classifier(x)
 
-# --- Data ---
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
-])
-train_loader = DataLoader(datasets.CIFAR10('.', train=True, download=True, transform=transform),
-                          batch_size=128, shuffle=True)
-test_loader = DataLoader(datasets.CIFAR10('.', train=False, download=True, transform=transform),
-                         batch_size=128)
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 # --- LTH components ---
 def train(model, loader, optimizer):
     model.train()
@@ -101,63 +92,273 @@ def test(model, loader):
             correct += (pred == y).sum().item()
     return correct / len(loader.dataset)
 
-def get_initial_weights(model):
-    return {name: param.clone() for name, param in model.named_parameters()}
+def correlation_mask(weight_tensor: torch.Tensor, global_mask=None, relative_margin=0.15, verbose=True, layer_name="layer", axis=0):
+    """
+    Általános korrelációalapú maszkolás.
+    - axis=0: sorok (kimeneti neuronok) prunolása
+    - axis=1: oszlopok (bemeneti neuronok) prunolása
+    """
+    W = weight_tensor.detach().cpu().numpy()
 
-def initialize_mask(model):
-    return {name: torch.ones_like(param) for name, param in model.named_parameters() if 'weight' in name}
+    if global_mask is not None:
+        W = W * global_mask.cpu().numpy()
 
-def apply_mask(model, mask):
-    for name, param in model.named_parameters():
-        if name in mask:
-            param.data *= mask[name]
+    if axis == 0:
+        norms = np.linalg.norm(W, axis=1)
+        nonzero_indices = np.where(norms > 1e-6)[0]
+        data_for_corr = W[nonzero_indices]
+    elif axis == 1:
+        norms = np.linalg.norm(W, axis=0)
+        nonzero_indices = np.where(norms > 1e-6)[0]
+        data_for_corr = W[:, nonzero_indices].T
+    else:
+        raise ValueError("axis must be 0 (rows) or 1 (columns)")
 
-def prune_by_percentile(model, mask, percent):
-    all_weights = torch.cat([
-        param[mask[name] != 0].abs().flatten()
-        for name, param in model.named_parameters()
-        if name in mask
+    if len(nonzero_indices) < 2:
+        if verbose:
+            print(f"  [Debug] {layer_name}: kevés nem-nulla {'sor' if axis==0 else 'oszlop'} maradt, nincs értelme korrelációt számolni.")
+        return global_mask.clone() if global_mask is not None else torch.ones_like(weight_tensor)
+
+    corr_matrix = np.corrcoef(data_for_corr)
+    np.fill_diagonal(corr_matrix, 0.0)
+
+    max_corr = np.nanmax(np.abs(corr_matrix))
+    threshold = max(max_corr - relative_margin, 0.0)
+
+    if verbose:
+        print(f"  [Debug] {layer_name}: max(abs(corr)) = {max_corr:.4f}, threshold = {threshold:.4f}")
+
+    mask = np.ones_like(W)
+    already_pruned = set()
+
+    for i in range(len(nonzero_indices)):
+        for j in range(i + 1, len(nonzero_indices)):
+            if abs(corr_matrix[i, j]) > threshold:
+                j_idx = int(nonzero_indices[j])
+                if j_idx not in already_pruned:
+                    if axis == 0:
+                        mask[j_idx, :] = 0.0
+                    else:
+                        mask[:, j_idx] = 0.0
+                    already_pruned.add(j_idx)
+
+    if verbose:
+        print(f"  [Debug] {layer_name}: nullázva ({'sor' if axis==0 else 'oszlop'} indexek): {sorted(list(already_pruned))}")
+
+    final_mask = torch.tensor(mask, dtype=torch.float32, device=weight_tensor.device)
+    if global_mask is not None:
+        final_mask *= global_mask
+    return final_mask
+
+def propagate_mask(prev_mask: torch.Tensor, next_weight: torch.Tensor) -> torch.Tensor:
+    row_sums = prev_mask.sum(dim=1)
+    zero_rows = (row_sums == 0).nonzero(as_tuple=False).squeeze()
+    next_mask = torch.ones_like(next_weight)
+    if zero_rows.numel() > 0:
+        next_mask[:, zero_rows] = 0.0
+    return next_mask
+
+def prune_mixer_model(model, global_masks, relative_margin=0.15, verbose=True):
+    """
+    Korrelációalapú pruning minden MixerBlock token_mlp és channel_mlp részén.
+    Csak az fc1 rétegekben történik korrelációszámítás.
+    Az fc2 rétegek maszkolása az fc1 kiesett kimenetei alapján történik.
+    """
+    new_global_masks = []
+
+    for i, block in enumerate(model.mixer_blocks):
+        device = block.token_mlp.fc1.weight.device
+
+        # === TOKEN MLP ===
+        # fc1: korrelációs pruning
+        mask_token_fc1 = correlation_mask(
+            block.token_mlp.fc1.weight,
+            global_mask=global_masks[i]['fc1'],
+            relative_margin=relative_margin,
+            verbose=verbose,
+            layer_name=f"token_mlp_fc1_block_{i}"
+        )
+
+        # fc2 bemenete = fc1 output → propagált
+        mask_token_fc2 = global_masks[i]['fc2'] * propagate_mask(mask_token_fc1, block.token_mlp.fc2.weight).to(device)
+
+        # === CHANNEL MLP ===
+        # fc1: korrelációs pruning
+        mask_channel_fc1 = correlation_mask(
+            block.channel_mlp.fc1.weight,
+            global_mask=global_masks[i]['channel_fc1'],
+            relative_margin=relative_margin,
+            verbose=verbose,
+            layer_name=f"channel_mlp_fc1_block_{i}"
+        )
+
+        # fc2 bemenete = fc1 output → propagált
+        mask_channel_fc2 = global_masks[i]['channel_fc2'] * propagate_mask(mask_channel_fc1, block.channel_mlp.fc2.weight).to(device)
+
+        # === APPLY ALL MASKS ===
+        with torch.no_grad():
+            block.token_mlp.fc1.weight *= mask_token_fc1
+            block.token_mlp.fc2.weight *= mask_token_fc2
+            block.channel_mlp.fc1.weight *= mask_channel_fc1
+            block.channel_mlp.fc2.weight *= mask_channel_fc2
+
+        # === UPDATE GLOBAL MASKS ===
+        new_global_masks.append({
+            'fc1': global_masks[i]['fc1'] * mask_token_fc1,
+            'fc2': global_masks[i]['fc2'] * mask_token_fc2,
+            'channel_fc1': global_masks[i]['channel_fc1'] * mask_channel_fc1,
+            'channel_fc2': global_masks[i]['channel_fc2'] * mask_channel_fc2
+        })
+
+    return new_global_masks
+
+
+def build_fully_pruned_mixer_model(model, global_masks):
+    """
+    Új MLPMixer modellt épít a pruning maszkok alapján, megtartva a neuronok sorrendjét.
+    Csak a token_mlp.fc1 és channel_mlp.fc1 output dimenzióit csökkentjük.
+    """
+    device = next(model.parameters()).device
+    new_blocks = []
+
+    for i, block in enumerate(model.mixer_blocks):
+        # === Maszkok ===
+        token_fc1_mask = global_masks[i]['fc1']  # [out, in]
+        token_fc2_mask = global_masks[i]['fc2']  # [out, in]
+        channel_fc1_mask = global_masks[i]['channel_fc1']
+        channel_fc2_mask = global_masks[i]['channel_fc2']
+
+        # === Aktív neuronindexek (megőrizzük sorrendet) ===
+        token_fc1_rows = (token_fc1_mask.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
+        channel_fc1_rows = (channel_fc1_mask.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
+
+        # Dimenziók
+        num_patches = block.token_mlp.fc1.in_features  # bemenet mérete a token_mlp-hez (pl. 49 patch)
+        dim = block.channel_mlp.fc1.in_features        # fix: minden blokk ugyanazzal a dim-mel dolgozik
+        token_dim = len(token_fc1_rows)
+        channel_dim = len(channel_fc1_rows)
+
+        # === Új blokk létrehozása ===
+        new_block = MixerBlock(
+            num_patches=num_patches,
+            dim=dim,
+            token_dim=token_dim,
+            channel_dim=channel_dim
+        ).to(device)
+
+        # === Súlyok másolása ===
+        with torch.no_grad():
+            # TOKEN MLP
+            new_block.token_mlp.fc1.weight.copy_(block.token_mlp.fc1.weight[token_fc1_rows])
+            new_block.token_mlp.fc2.weight.copy_(block.token_mlp.fc2.weight[:, token_fc1_rows])
+
+            # CHANNEL MLP
+            new_block.channel_mlp.fc1.weight.copy_(block.channel_mlp.fc1.weight[channel_fc1_rows])
+            new_block.channel_mlp.fc2.weight.copy_(block.channel_mlp.fc2.weight[:, channel_fc1_rows])
+            
+
+        # Normák
+        new_block.norm1.load_state_dict(block.norm1.state_dict())
+        new_block.norm2.load_state_dict(block.norm2.state_dict())
+
+        new_blocks.append(new_block)
+
+    # === Új modell összeállítása ===
+    pruned_mixer = MLPMixer(
+        image_size=int(model.patch_size * (model.mixer_blocks[0].token_mlp.fc1.in_features) ** 0.5),
+        patch_size=model.patch_size,
+        dim=model.embedding.out_features,
+        depth=len(new_blocks),
+        num_classes=model.classifier.out_features,
+        token_dim=token_dim,      # csak formálisan kell, az új blokkokban külön szerepel
+        channel_dim=channel_dim
+    ).to(device)
+
+    pruned_mixer.mixer_blocks = nn.Sequential(*new_blocks)
+
+    # === Embedding, classifier, norm rétegek másolása ===
+    pruned_mixer.embedding.load_state_dict(model.embedding.state_dict())
+    pruned_mixer.norm.load_state_dict(model.norm.state_dict())
+    pruned_mixer.classifier.load_state_dict(model.classifier.state_dict())
+
+    return pruned_mixer
+
+def lottery_ticket_mixer_cycle(device, prune_steps=9, relative_margin=0.15):
+    # --- Data ---
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
     ])
-    threshold = torch.quantile(all_weights, percent)
-    for name, param in model.named_parameters():
-        if name in mask:
-            mask[name] = (param.abs() > threshold).float()
+    train_loader = DataLoader(datasets.CIFAR10('.', train=True, download=True, transform=transform),
+                            batch_size=128, shuffle=True)
+    test_loader = DataLoader(datasets.CIFAR10('.', train=False, download=True, transform=transform),
+                            batch_size=128)
 
-def report_sparsity(mask):
-    total = sum(m.numel() for m in mask.values())
-    zeroed = sum((m == 0).sum().item() for m in mask.values())
-    print(f"Sparsity: {zeroed}/{total} weights pruned ({100 * zeroed / total:.2f}%)")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- Lottery Ticket Pruning cycle ---
-num_iterations = 10
-epochs_per_iteration = 20  # Increase epochs per iteration for better convergence
-prune_percent = 0.1        # Prune less aggressively
-lr = 0.001
-
-model = MLPMixer().to(device)
-initial_weights = get_initial_weights(model)
-mask = initialize_mask(model)
-
-for iteration in range(num_iterations):
-    print(f"\n--- Iteration {iteration+1} ---")
-
-    # Re-initialize
     model = MLPMixer().to(device)
-    for name, param in model.named_parameters():
-        param.data = initial_weights[name].clone()
+    print(model)
+    initial_state = copy.deepcopy(model.state_dict())
 
-    apply_mask(model, mask)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    # Globális maszk inicializálása minden blokkra
+    global_masks = []
+    for block in model.mixer_blocks:
+        m = {
+            'fc1': torch.ones_like(block.token_mlp.fc1.weight),
+            'fc2': torch.ones_like(block.token_mlp.fc2.weight),
+            'channel_fc1': torch.ones_like(block.channel_mlp.fc1.weight),
+            'channel_fc2': torch.ones_like(block.channel_mlp.fc2.weight),
+        }
+        global_masks.append(m)
 
-    # Training
-    for epoch in trange(epochs_per_iteration, desc="Epochs", leave=False):
-        avg_loss = train(model, train_loader, optimizer)
-        print(f"  Epoch {epoch+1}/{epochs_per_iteration} - Train loss: {avg_loss:.4f}")
+    for step in range(prune_steps):
+        print(f"\n=== MIXER PRUNING STEP {step + 1} ===")
 
-    acc = test(model, test_loader)
-    print(f"Test accuracy: {acc:.4f}")
-    report_sparsity(mask)
+        model = MLPMixer().to(device)
+        model.load_state_dict(copy.deepcopy(initial_state))
+        optimizer = torch.optim.Adam(model.parameters())
 
-    # Pruning
-    prune_by_percentile(model, mask, prune_percent)
-    apply_mask(model, mask)
+        # Maszkolás alkalmazása a súlyokra
+        with torch.no_grad():
+            for i, block in enumerate(model.mixer_blocks):
+                block.token_mlp.fc1.weight *= global_masks[i]['fc1'].to(device)
+                block.token_mlp.fc2.weight *= global_masks[i]['fc2'].to(device)
+                block.channel_mlp.fc1.weight *= global_masks[i]['channel_fc1'].to(device)
+                block.channel_mlp.fc2.weight *= global_masks[i]['channel_fc2'].to(device)
+
+        for epoch in range(3):
+            train(model, train_loader, optimizer)
+            start = time.time()
+            acc = test(model, test_loader)
+            elapsed = time.time() - start
+            print(f"Epoch {epoch + 1}: accuracy={acc:.4f} - {elapsed:.4f} seconds")
+
+        # Mentés az utolsó iterációban
+        if step == prune_steps - 1:
+            torch.save(model.state_dict(), "mixer_pruned_model.pt")
+            print("Final pruned Mixer model saved as 'mixer_pruned_model.pt'")
+            break
+
+        # Új maszkolás
+        global_masks = prune_mixer_model(model, global_masks, relative_margin=relative_margin)
+        
+        # Log pruning statistics
+        for i, block in enumerate(model.mixer_blocks):
+            for name, weight in [('token_mlp.fc1', block.token_mlp.fc1.weight), ('token_mlp.fc2', block.token_mlp.fc2.weight), 
+                                 ('channel_mlp.fc1', block.channel_mlp.fc1.weight), ('channel_mlp.fc2', block.channel_mlp.fc2.weight)]:
+                num_zero = torch.sum(weight == 0).item()
+                total = weight.numel()
+                sparsity = 100.0 * num_zero / total
+                print(f"[Pruning Info] Block {i} {name} nullázott súlyok: {num_zero}/{total} ({sparsity:.2f}%)")
+    
+    pruned_mixer = build_fully_pruned_mixer_model(model, global_masks)
+    start = time.time()
+    acc = test(pruned_mixer, test_loader, device)
+    elapsed = time.time() - start
+
+    print(f"[Eval] pruned modell - Inference time on test set: {elapsed:.4f} seconds - accuracy={acc:.4f}")
+    print(pruned_mixer)
+
+# === Futtatás ===
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+lottery_ticket_mixer_cycle(device)
