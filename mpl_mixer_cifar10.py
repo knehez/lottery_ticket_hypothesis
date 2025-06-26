@@ -335,8 +335,16 @@ def lottery_ticket_mixer_cycle(device, prune_steps=9, relative_margin=0.15):
 
         # Mentés az utolsó iterációban
         if step == prune_steps - 1:
-            torch.save(model.state_dict(), "mixer_pruned_model.pt")
+            torch.save(model.state_dict(), "original_mixer_model.pt")
             print("Final pruned Mixer model saved as 'mixer_pruned_model.pt'")
+            pruned_mixer = build_fully_pruned_mixer_model(model, global_masks)
+            start = time.time()
+            acc = test(pruned_mixer, test_loader)
+            elapsed = time.time() - start
+
+            print(f"[Eval] pruned modell - Inference time on test set: {elapsed:.4f} seconds - accuracy={acc:.4f}")
+            print(pruned_mixer)
+            torch.save(pruned_mixer.state_dict(), "pruned_mixer_model.pt")
             break
 
         # Új maszkolás
@@ -351,14 +359,6 @@ def lottery_ticket_mixer_cycle(device, prune_steps=9, relative_margin=0.15):
                 sparsity = 100.0 * num_zero / total
                 print(f"[Pruning Info] Block {i} {name} nullázott súlyok: {num_zero}/{total} ({sparsity:.2f}%)")
     
-    pruned_mixer = build_fully_pruned_mixer_model(model, global_masks)
-    start = time.time()
-    acc = test(pruned_mixer, test_loader)
-    elapsed = time.time() - start
-
-    print(f"[Eval] pruned modell - Inference time on test set: {elapsed:.4f} seconds - accuracy={acc:.4f}")
-    print(pruned_mixer)
-
 # === Futtatás ===
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 lottery_ticket_mixer_cycle(device)
