@@ -267,7 +267,8 @@ def build_fully_pruned_mixer_model(model, global_masks):
         depth=len(new_blocks),
         num_classes=model.classifier.out_features,
         token_dim=token_dim,      # csak formálisan kell, az új blokkokban külön szerepel
-        channel_dim=channel_dim
+        channel_dim=channel_dim,
+        in_channels=model.in_channels
     ).to(device)
 
     pruned_mixer.mixer_blocks = nn.Sequential(*new_blocks)
@@ -338,6 +339,8 @@ def lottery_ticket_mixer_cycle(prune_steps=9, relative_margin=0.15):
             print(f"[Eval] pruned modell - Inference time on test set: {elapsed:.4f} seconds - accuracy={acc:.4f}")
             print(pruned_mixer)
             torch.save(pruned_mixer.state_dict(), "pruned_mixer_model.pt")
+            print("Original embedding in_features:", model.embedding.in_features)
+            print("Rebuilt embedding in_features:", pruned_mixer.embedding.in_features)
             break
 
         # Új maszkolás
