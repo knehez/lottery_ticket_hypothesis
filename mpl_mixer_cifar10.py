@@ -353,7 +353,7 @@ def lottery_ticket_mixer_cycle(device, prune_steps=9, relative_margin=0.15):
     
     pruned_mixer = build_fully_pruned_mixer_model(model, global_masks)
     start = time.time()
-    acc = test(pruned_mixer, test_loader, device)
+    acc = test(pruned_mixer, test_loader)
     elapsed = time.time() - start
 
     print(f"[Eval] pruned modell - Inference time on test set: {elapsed:.4f} seconds - accuracy={acc:.4f}")
