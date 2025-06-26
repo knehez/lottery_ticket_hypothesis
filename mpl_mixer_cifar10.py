@@ -66,31 +66,27 @@ class MLPMixer(nn.Module):
         return self.classifier(x)
 
 # --- LTH components ---
-def train(model, loader, optimizer):
+def train(model, optimizer, dataloader, device):
     model.train()
-    total_loss = 0.0
-    total_samples = 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
+    for data, target in dataloader:
+        data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
-        output = model(x)
-        loss = F.cross_entropy(output, y)
+        output = model(data)
+        loss = F.cross_entropy(output, target)
         loss.backward()
         optimizer.step()
-        total_loss += loss.item() * x.size(0)
-        total_samples += x.size(0)
-    avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
-    return avg_loss
 
-def test(model, loader):
+def test(model, dataloader, device):
     model.eval()
     correct = 0
     with torch.no_grad():
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            pred = model(x).argmax(dim=1)
-            correct += (pred == y).sum().item()
-    return correct / len(loader.dataset)
+        for data, target in dataloader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+    return correct / len(dataloader.dataset)
+
 
 def correlation_mask(weight_tensor: torch.Tensor, global_mask=None, relative_margin=0.15, verbose=True, layer_name="layer", axis=0):
     """
@@ -324,9 +320,9 @@ def lottery_ticket_mixer_cycle(prune_steps=9, relative_margin=0.15):
                 block.channel_mlp.fc2.weight *= global_masks[i]['channel_fc2'].to(device)
 
         for epoch in range(5):
-            train(model, train_loader, optimizer)
+            train(model, optimizer, train_loader, device)
             start = time.time()
-            acc = test(model, test_loader)
+            acc = test(model, test_loader, device)
             elapsed = time.time() - start
             print(f"Epoch {epoch + 1}: accuracy={acc:.4f} - {elapsed:.4f} seconds")
 
@@ -336,7 +332,7 @@ def lottery_ticket_mixer_cycle(prune_steps=9, relative_margin=0.15):
             print("Final pruned Mixer model saved as 'mixer_pruned_model.pt'")
             pruned_mixer = build_fully_pruned_mixer_model(model, global_masks)
             start = time.time()
-            acc = test(pruned_mixer, test_loader)
+            acc = test(pruned_mixer, test_loader, device)
             elapsed = time.time() - start
 
             print(f"[Eval] pruned modell - Inference time on test set: {elapsed:.4f} seconds - accuracy={acc:.4f}")
@@ -357,5 +353,4 @@ def lottery_ticket_mixer_cycle(prune_steps=9, relative_margin=0.15):
                 print(f"[Pruning Info] Block {i} {name} nullázott súlyok: {num_zero}/{total} ({sparsity:.2f}%)")
     
 # === Futtatás ===
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-lottery_ticket_mixer_cycle(device)
+lottery_ticket_mixer_cycle()
