@@ -13,9 +13,9 @@ import copy
 class MLP(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
-        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.fc1 = nn.Linear(dim, hidden_dim, bias=False)
         self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden_dim, dim)
+        self.fc2 = nn.Linear(hidden_dim, dim, bias=False)
 
     def forward(self, x):
         return self.fc2(self.act(self.fc1(x)))
