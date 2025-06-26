@@ -31,44 +31,58 @@ def test(model, dataloader, device):
             correct += pred.eq(target).sum().item()
     return correct / len(dataloader.dataset)
 
-# ==== 3. Korrelációs maszkolás ====
-def correlation_mask(weight_tensor: torch.Tensor, global_mask=None, relative_margin=0.15, verbose=True, layer_name="layer"):
+def correlation_mask(weight_tensor: torch.Tensor, global_mask=None, relative_margin=0.15, verbose=True, layer_name="layer", axis=0):
+    """
+    Általános korrelációalapú maszkolás.
+    - axis=0: sorok (kimeneti neuronok) prunolása
+    - axis=1: oszlopok (bemeneti neuronok) prunolása
+    """
     W = weight_tensor.detach().cpu().numpy()
 
     if global_mask is not None:
         W = W * global_mask.cpu().numpy()
 
-    row_norms = np.linalg.norm(W, axis=1)
-    nonzero_rows = np.where(row_norms > 1e-6)[0]
+    if axis == 0:
+        norms = np.linalg.norm(W, axis=1)
+        nonzero_indices = np.where(norms > 1e-6)[0]
+        data_for_corr = W[nonzero_indices]
+    elif axis == 1:
+        norms = np.linalg.norm(W, axis=0)
+        nonzero_indices = np.where(norms > 1e-6)[0]
+        data_for_corr = W[:, nonzero_indices].T
+    else:
+        raise ValueError("axis must be 0 (rows) or 1 (columns)")
 
-    if len(nonzero_rows) < 2:
+    if len(nonzero_indices) < 2:
         if verbose:
-            print(f"  [Debug] {layer_name}: kevés nem-nulla neuron maradt, nincs értelme korrelációt számolni.")
+            print(f"  [Debug] {layer_name}: kevés nem-nulla {'sor' if axis==0 else 'oszlop'} maradt, nincs értelme korrelációt számolni.")
         return global_mask.clone() if global_mask is not None else torch.ones_like(weight_tensor)
-    
-    w_filtered = W[nonzero_rows]
-    corr_matrix = np.corrcoef(w_filtered)
+
+    corr_matrix = np.corrcoef(data_for_corr)
     np.fill_diagonal(corr_matrix, 0.0)
 
     max_corr = np.nanmax(np.abs(corr_matrix))
     threshold = max(max_corr - relative_margin, 0.0)
 
     if verbose:
-        print(f"  [Debug] {layer_name}: max(abs(corr)) = {max_corr:.4f}, dynamic threshold = {threshold:.4f}")
+        print(f"  [Debug] {layer_name}: max(abs(corr)) = {max_corr:.4f}, threshold = {threshold:.4f}")
 
     mask = np.ones_like(W)
     already_pruned = set()
 
-    for i in range(len(nonzero_rows)):
-        for j in range(i + 1, len(nonzero_rows)):
+    for i in range(len(nonzero_indices)):
+        for j in range(i + 1, len(nonzero_indices)):
             if abs(corr_matrix[i, j]) > threshold:
-                j_idx = int(nonzero_rows[j])
+                j_idx = int(nonzero_indices[j])
                 if j_idx not in already_pruned:
-                    mask[j_idx, :] = 0.0
+                    if axis == 0:
+                        mask[j_idx, :] = 0.0
+                    else:
+                        mask[:, j_idx] = 0.0
                     already_pruned.add(j_idx)
 
     if verbose:
-        print(f"  [Debug] {layer_name}: neuronok nullázva (indexek): {sorted(list(already_pruned))}")
+        print(f"  [Debug] {layer_name}: nullázva ({'sor' if axis==0 else 'oszlop'} indexek): {sorted(list(already_pruned))}")
 
     final_mask = torch.tensor(mask, dtype=torch.float32, device=weight_tensor.device)
     if global_mask is not None:
@@ -180,6 +194,7 @@ def build_fully_pruned_mixer_model(model, global_masks):
             # CHANNEL MLP
             new_block.channel_mlp.fc1.weight.copy_(block.channel_mlp.fc1.weight[channel_fc1_rows])
             new_block.channel_mlp.fc2.weight.copy_(block.channel_mlp.fc2.weight[:, channel_fc1_rows])
+            
 
         # Normák
         new_block.norm1.load_state_dict(block.norm1.state_dict())
@@ -209,15 +224,15 @@ def build_fully_pruned_mixer_model(model, global_masks):
 
 
 # ==== 4. LTH ciklus ====
-def lottery_ticket_mixer_cycle(device, prune_steps=3, relative_margin=0.15):
+def lottery_ticket_mixer_cycle(device, prune_steps=9, relative_margin=0.15):
     transform = transforms.ToTensor()
     train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
     test_dataset = datasets.MNIST('./data', train=False, download=True, transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=1000)
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=1000, pin_memory=True)
 
     model = MLPMixer().to(device)
-
+    print(model)
     initial_state = copy.deepcopy(model.state_dict())
 
     # Globális maszk inicializálása minden blokkra
@@ -243,6 +258,8 @@ def lottery_ticket_mixer_cycle(device, prune_steps=3, relative_margin=0.15):
             for i, block in enumerate(model.mixer_blocks):
                 block.token_mlp.fc1.weight *= global_masks[i]['fc1'].to(device)
                 block.token_mlp.fc2.weight *= global_masks[i]['fc2'].to(device)
+                block.channel_mlp.fc1.weight *= global_masks[i]['channel_fc1'].to(device)
+                block.channel_mlp.fc2.weight *= global_masks[i]['channel_fc2'].to(device)
 
         for epoch in range(3):
             train(model, optimizer, train_loader, device)

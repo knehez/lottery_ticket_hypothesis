@@ -28,7 +28,7 @@ class MixerBlock(nn.Module):
         return x
 
 class MLPMixer(nn.Module):
-    def __init__(self, image_size=28, patch_size=4, dim=64, depth=8, num_classes=10, token_dim=32, channel_dim=128):
+    def __init__(self, image_size=28, patch_size=4, dim=64, depth=4, num_classes=10, token_dim=32, channel_dim=128):
         super().__init__()
         assert image_size % patch_size == 0
         num_patches = (image_size // patch_size) ** 2
