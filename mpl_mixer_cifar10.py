@@ -1,3 +1,4 @@
+from xml.parsers.expat import model
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -268,7 +269,8 @@ def build_fully_pruned_mixer_model(model, global_masks):
     pruned_mixer.embedding.load_state_dict(model.embedding.state_dict())
     pruned_mixer.norm.load_state_dict(model.norm.state_dict())
     pruned_mixer.classifier.load_state_dict(model.classifier.state_dict())
-
+    print("Num of parameters in pruned model:", sum(p.numel() for p in pruned_mixer.parameters()))
+    print("Num of parameters in original model:", sum(p.numel() for p in model.parameters()))
     return pruned_mixer
 
 def lottery_ticket_mixer_cycle(prune_steps=9, relative_margin=0.15):
