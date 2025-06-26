@@ -36,7 +36,7 @@ class MixerBlock(nn.Module):
         return x
 
 class MLPMixer(nn.Module):
-    def __init__(self, image_size=32, patch_size=8, dim=192, depth=8, num_classes=10, token_dim=96, channel_dim=768, in_channels=3):
+    def __init__(self, image_size=32, patch_size=8, dim=512, depth=8, num_classes=10, token_dim=512, channel_dim=768, in_channels=3):
         super().__init__()
         assert image_size % patch_size == 0
         num_patches = (image_size // patch_size) ** 2
@@ -330,6 +330,18 @@ def lottery_ticket_mixer_cycle(prune_steps=9, relative_margin=0.15):
             print(f"[Eval] pruned modell - Inference time on test set: {elapsed:.4f} seconds - accuracy={acc:.4f}")
             print(pruned_mixer)
             torch.save(pruned_mixer.state_dict(), "pruned_mixer_model.pt")
+            dummy_input = torch.randn(1, 3, 32, 32).to(device)  # MNIST-re például
+            # ONNX exportálás
+            torch.onnx.export(
+                pruned_mixer,
+                dummy_input,
+                "pruned_model.onnx",
+                input_names=["input"],
+                output_names=["output"],
+                dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+                opset_version=20
+            )
+
             break
 
         # Új maszkolás
