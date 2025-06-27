@@ -84,9 +84,9 @@ def test(model, dataloader, device):
     with torch.no_grad():
         for data, target in dataloader:
             data, target = data.to(device), target.to(device)
-            start = time.time()
+            start = time.perf_counter()
             output = model(data)
-            total_infer_time += time.time() - start
+            total_infer_time += time.perf_counter() - start
             pred = output.argmax(dim=1)
             correct += pred.eq(target).sum().item()
     return correct / len(dataloader.dataset), total_infer_time
