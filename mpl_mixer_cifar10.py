@@ -38,7 +38,7 @@ class MixerBlock(nn.Module):
         return x
 
 class MLPMixer(nn.Module):
-    def __init__(self, image_size=32, patch_size=8, dim=192, depth=8, num_classes=10, token_dim=96, channel_dim=768, in_channels=3):
+    def __init__(self, image_size=32, patch_size=8, dim=512, depth=8, num_classes=10, token_dim=512, channel_dim=768, in_channels=3):
         super().__init__()
         assert image_size % patch_size == 0
         num_patches = (image_size // patch_size) ** 2
@@ -273,3 +273,103 @@ def build_fully_pruned_mixer_model(model, global_masks):
             new_block.channel_mlp.fc1.bias.copy_(block.channel_mlp.fc1.bias[channel_mlp_fc1_rows])
             new_block.channel_mlp.fc2.weight.copy_(block.channel_mlp.fc2.weight[:, channel_mlp_fc1_rows])
             new_block.channel_mlp.fc2.bias.copy_(block.channel_mlp.fc2.bias)
+
+        new_block.norm1.load_state_dict(block.norm1.state_dict())
+        new_block.norm2.load_state_dict(block.norm2.state_dict())
+
+        new_blocks.append(new_block)
+
+    pruned_mixer = MLPMixer().to(device)
+    pruned_mixer.mixer_blocks = nn.Sequential(*new_blocks)
+    pruned_mixer.embedding.load_state_dict(model.embedding.state_dict())
+    pruned_mixer.norm.load_state_dict(model.norm.state_dict())
+    pruned_mixer.classifier.load_state_dict(model.classifier.state_dict())
+    print("Num of parameters in pruned model:", sum(p.numel() for p in pruned_mixer.parameters()))
+    print("Num of parameters in original model:", sum(p.numel() for p in model.parameters()))
+    return pruned_mixer
+
+def lottery_ticket_mixer_cycle(prune_steps=9, relative_margin=0.15):
+    # --- Data ---
+    transform = transforms.ToTensor()
+    train_loader = DataLoader(datasets.CIFAR10('.', train=True, download=True, transform=transform),
+                            batch_size=128, shuffle=True)
+    test_loader = DataLoader(datasets.CIFAR10('.', train=False, download=True, transform=transform),
+                            batch_size=128)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = MLPMixer().to(device)
+    print(model)
+    initial_state = copy.deepcopy(model.state_dict())
+
+    # Globális maszk inicializálása minden blokkra
+    global_masks = []
+    for block in model.mixer_blocks:
+        m = {
+            'token_mlp.fc1': torch.ones_like(block.token_mlp.fc1.weight),
+            'token_mlp.fc2': torch.ones_like(block.token_mlp.fc2.weight),
+            'channel_mlp.fc1': torch.ones_like(block.channel_mlp.fc1.weight),
+            'channel_mlp.fc2': torch.ones_like(block.channel_mlp.fc2.weight),
+        }
+        global_masks.append(m)
+
+    for step in range(prune_steps):
+        print(f"\n=== MIXER PRUNING STEP {step + 1} ===")
+
+        model = MLPMixer().to(device)
+        model.load_state_dict(copy.deepcopy(initial_state))
+        optimizer = torch.optim.Adam(model.parameters())
+
+        # Maszkolás alkalmazása a súlyokra
+        with torch.no_grad():
+            for i, block in enumerate(model.mixer_blocks):
+                block.token_mlp.fc1.weight *= global_masks[i]['token_mlp.fc1'].to(device)
+                block.token_mlp.fc2.weight *= global_masks[i]['token_mlp.fc2'].to(device)
+                block.channel_mlp.fc1.weight *= global_masks[i]['channel_mlp.fc1'].to(device)
+                block.channel_mlp.fc2.weight *= global_masks[i]['channel_mlp.fc2'].to(device)
+
+        for epoch in range(5):
+            train(model, optimizer, train_loader, device)
+            acc, elapsed = test(model, test_loader, device)
+            print(f"Epoch {epoch + 1}: accuracy={acc:.4f} - {elapsed:.4f} seconds")
+
+        # Mentés az utolsó iterációban
+        if step == prune_steps - 1:
+            torch.save(model.state_dict(), "original_mixer_model.pt")
+            print("Final pruned Mixer model saved as 'mixer_pruned_model.pt'")
+            pruned_mixer = build_fully_pruned_mixer_model(model, global_masks)
+            acc, elapsed = test(pruned_mixer, test_loader, device)
+            print(f"[Eval] pruned modell - Inference time on test set: {elapsed:.4f} seconds - accuracy={acc:.4f}")
+            print(pruned_mixer)
+            torch.save(pruned_mixer.state_dict(), "pruned_mixer_model.pt")
+            dummy_input = torch.randn(1, 3, 32, 32).to(device)
+            # ONNX exportálás
+            torch.onnx.export(
+                pruned_mixer,
+                dummy_input,
+                "pruned_model.onnx",
+                input_names=["input"],
+                output_names=["output"],
+                dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+                opset_version=20
+            )
+            break
+
+        # Új maszkolás
+        global_masks = prune_mixer_model(model, global_masks, relative_margin=relative_margin)
+        
+        # Log pruning statistics
+        for i, block in enumerate(model.mixer_blocks):
+            for name, weight in [
+                ('token_mlp.fc1', block.token_mlp.fc1.weight),
+                ('token_mlp.fc2', block.token_mlp.fc2.weight),
+                ('channel_mlp.fc1', block.channel_mlp.fc1.weight),
+                ('channel_mlp.fc2', block.channel_mlp.fc2.weight)
+            ]:
+                num_zero = torch.sum(weight == 0).item()
+                total = weight.numel()
+                sparsity = 100.0 * num_zero / total
+                print(f"[Pruning Info] Block {i} {name} nullázott súlyok: {num_zero}/{total} ({sparsity:.2f}%)")
+    
+# === Futtatás ===
+lottery_ticket_mixer_cycle()
