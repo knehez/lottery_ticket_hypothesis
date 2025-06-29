@@ -14,9 +14,9 @@ import copy
 class MLP(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
-        self.fc1 = nn.Linear(dim, hidden_dim, bias=True)  # bias visszaállítva
+        self.fc1 = nn.Linear(dim, hidden_dim, bias=False)
         self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden_dim, dim, bias=True)  # bias visszaállítva
+        self.fc2 = nn.Linear(hidden_dim, dim, bias=False)
 
     def forward(self, x):
         return self.fc2(self.act(self.fc1(x)))
@@ -58,6 +58,7 @@ class MLPMixer(nn.Module):
         # x: [B, 3, 32, 32]
         B, C, H, W = x.shape
         p = self.patch_size
+        # x.unfold: [B, C, n_patches_h, n_patches_w, p, p]
         x = x.unfold(2, p, p).unfold(3, p, p)  # [B, C, n_patches_h, n_patches_w, p, p]
         x = x.permute(0, 2, 3, 1, 4, 5).contiguous()  # [B, n_patches_h, n_patches_w, C, p, p]
         x = x.view(B, -1, C * p * p)  # [B, N, patch_dim], N = num_patches
@@ -190,32 +191,12 @@ def prune_mixer_model(model, global_masks, relative_margin=0.15, verbose=True):
         )
         mask_channel_mlp_fc2 = global_masks[i]['channel_mlp.fc2'] * propagate_mask(mask_channel_mlp_fc1, block.channel_mlp.fc2.weight).to(device)
 
-        # === APPLY ALL MASKS (bias is masked if all weights in a row are zero) ===
+        # === APPLY ALL MASKS ===
         with torch.no_grad():
-            # token_mlp.fc1
             block.token_mlp.fc1.weight *= mask_token_mlp_fc1
-            if block.token_mlp.fc1.bias is not None:
-                for idx in range(block.token_mlp.fc1.weight.shape[0]):
-                    if torch.all(block.token_mlp.fc1.weight[idx] == 0):
-                        block.token_mlp.fc1.bias[idx] = 0.0
-            # token_mlp.fc2
             block.token_mlp.fc2.weight *= mask_token_mlp_fc2
-            if block.token_mlp.fc2.bias is not None:
-                for idx in range(block.token_mlp.fc2.weight.shape[0]):
-                    if torch.all(block.token_mlp.fc2.weight[idx] == 0):
-                        block.token_mlp.fc2.bias[idx] = 0.0
-            # channel_mlp.fc1
             block.channel_mlp.fc1.weight *= mask_channel_mlp_fc1
-            if block.channel_mlp.fc1.bias is not None:
-                for idx in range(block.channel_mlp.fc1.weight.shape[0]):
-                    if torch.all(block.channel_mlp.fc1.weight[idx] == 0):
-                        block.channel_mlp.fc1.bias[idx] = 0.0
-            # channel_mlp.fc2
             block.channel_mlp.fc2.weight *= mask_channel_mlp_fc2
-            if block.channel_mlp.fc2.bias is not None:
-                for idx in range(block.channel_mlp.fc2.weight.shape[0]):
-                    if torch.all(block.channel_mlp.fc2.weight[idx] == 0):
-                        block.channel_mlp.fc2.bias[idx] = 0.0
 
         # === UPDATE GLOBAL MASKS ===
         new_global_masks.append({
@@ -264,15 +245,11 @@ def build_fully_pruned_mixer_model(model, global_masks):
         with torch.no_grad():
             # TOKEN MLP
             new_block.token_mlp.fc1.weight.copy_(block.token_mlp.fc1.weight[token_mlp_fc1_rows])
-            new_block.token_mlp.fc1.bias.copy_(block.token_mlp.fc1.bias[token_mlp_fc1_rows])
             new_block.token_mlp.fc2.weight.copy_(block.token_mlp.fc2.weight[:, token_mlp_fc1_rows])
-            new_block.token_mlp.fc2.bias.copy_(block.token_mlp.fc2.weight[:, token_mlp_fc1_rows])
 
             # CHANNEL MLP
             new_block.channel_mlp.fc1.weight.copy_(block.channel_mlp.fc1.weight[channel_mlp_fc1_rows])
-            new_block.channel_mlp.fc1.bias.copy_(block.channel_mlp.fc1.bias[channel_mlp_fc1_rows])
             new_block.channel_mlp.fc2.weight.copy_(block.channel_mlp.fc2.weight[:, channel_mlp_fc1_rows])
-            new_block.channel_mlp.fc2.bias.copy_(block.channel_mlp.fc2.weight[:, channel_mlp_fc1_rows])
 
         new_block.norm1.load_state_dict(block.norm1.state_dict())
         new_block.norm2.load_state_dict(block.norm2.state_dict())
