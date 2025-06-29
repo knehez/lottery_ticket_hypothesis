@@ -38,7 +38,7 @@ class MixerBlock(nn.Module):
         return x
 
 class MLPMixer(nn.Module):
-    def __init__(self, image_size=32, patch_size=8, dim=512, depth=8, num_classes=10, token_dim=512, channel_dim=768, in_channels=3):
+    def __init__(self, image_size=32, patch_size=8, dim=128, depth=8, num_classes=10, token_dim=64, channel_dim=768, in_channels=3):
         super().__init__()
         assert image_size % patch_size == 0
         num_patches = (image_size // patch_size) ** 2
@@ -266,13 +266,13 @@ def build_fully_pruned_mixer_model(model, global_masks):
             new_block.token_mlp.fc1.weight.copy_(block.token_mlp.fc1.weight[token_mlp_fc1_rows])
             new_block.token_mlp.fc1.bias.copy_(block.token_mlp.fc1.bias[token_mlp_fc1_rows])
             new_block.token_mlp.fc2.weight.copy_(block.token_mlp.fc2.weight[:, token_mlp_fc1_rows])
-            new_block.token_mlp.fc2.bias.copy_(block.token_mlp.fc2.bias)
+            new_block.token_mlp.fc2.bias.copy_(block.token_mlp.fc2.weight[:, token_mlp_fc1_rows])
 
             # CHANNEL MLP
             new_block.channel_mlp.fc1.weight.copy_(block.channel_mlp.fc1.weight[channel_mlp_fc1_rows])
             new_block.channel_mlp.fc1.bias.copy_(block.channel_mlp.fc1.bias[channel_mlp_fc1_rows])
             new_block.channel_mlp.fc2.weight.copy_(block.channel_mlp.fc2.weight[:, channel_mlp_fc1_rows])
-            new_block.channel_mlp.fc2.bias.copy_(block.channel_mlp.fc2.bias)
+            new_block.channel_mlp.fc2.bias.copy_(block.channel_mlp.fc2.weight[:, channel_mlp_fc1_rows])
 
         new_block.norm1.load_state_dict(block.norm1.state_dict())
         new_block.norm2.load_state_dict(block.norm2.state_dict())
