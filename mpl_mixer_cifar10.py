@@ -14,9 +14,9 @@ import copy
 class MLP(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
-        self.fc1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.fc1 = nn.Linear(dim, hidden_dim, bias=True)
         self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.fc2 = nn.Linear(hidden_dim, dim, bias=True)
 
     def forward(self, x):
         return self.fc2(self.act(self.fc1(x)))
@@ -179,6 +179,7 @@ def prune_mixer_model(model, global_masks, relative_margin=0.15, verbose=True):
             verbose=verbose,
             layer_name=f"token_mlp_fc1_block_{i}"
         )
+        
         mask_token_mlp_fc2 = global_masks[i]['token_mlp.fc2'] * propagate_mask(mask_token_mlp_fc1, block.token_mlp.fc2.weight).to(device)
 
         # === CHANNEL MLP ===
@@ -190,19 +191,29 @@ def prune_mixer_model(model, global_masks, relative_margin=0.15, verbose=True):
             layer_name=f"channel_mlp_fc1_block_{i}"
         )
         mask_channel_mlp_fc2 = global_masks[i]['channel_mlp.fc2'] * propagate_mask(mask_channel_mlp_fc1, block.channel_mlp.fc2.weight).to(device)
+        
+        bias_mask_token_mlp_fc1 = (mask_token_mlp_fc1.sum(dim=1) != 0).float()
+        bias_mask_channel_mlp_fc1 = (mask_channel_mlp_fc1.sum(dim=1) != 0).float()
 
         # === APPLY ALL MASKS ===
         with torch.no_grad():
             block.token_mlp.fc1.weight *= mask_token_mlp_fc1
+            block.token_mlp.fc1.bias *= bias_mask_token_mlp_fc1
+            
             block.token_mlp.fc2.weight *= mask_token_mlp_fc2
+            
             block.channel_mlp.fc1.weight *= mask_channel_mlp_fc1
+            block.channel_mlp.fc1.bias *= bias_mask_channel_mlp_fc1
+            
             block.channel_mlp.fc2.weight *= mask_channel_mlp_fc2
 
         # === UPDATE GLOBAL MASKS ===
         new_global_masks.append({
             'token_mlp.fc1': global_masks[i]['token_mlp.fc1'] * mask_token_mlp_fc1,
+            'token_mlp.fc1_bias': global_masks[i]['token_mlp.fc1_bias'] * bias_mask_token_mlp_fc1,
             'token_mlp.fc2': global_masks[i]['token_mlp.fc2'] * mask_token_mlp_fc2,
             'channel_mlp.fc1': global_masks[i]['channel_mlp.fc1'] * mask_channel_mlp_fc1,
+            'channel_mlp.fc1_bias': global_masks[i]['channel_mlp.fc1_bias'] * bias_mask_channel_mlp_fc1,
             'channel_mlp.fc2': global_masks[i]['channel_mlp.fc2'] * mask_channel_mlp_fc2
         })
 
@@ -219,9 +230,10 @@ def build_fully_pruned_mixer_model(model, global_masks):
     for i, block in enumerate(model.mixer_blocks):
         # === Maszkok ===
         token_mlp_fc1_mask = global_masks[i]['token_mlp.fc1']
-        token_mlp_fc2_mask = global_masks[i]['token_mlp.fc2']
+        token_mlp_fc1_bias_mask = global_masks[i]['token_mlp.fc1_bias']    
+           
         channel_mlp_fc1_mask = global_masks[i]['channel_mlp.fc1']
-        channel_mlp_fc2_mask = global_masks[i]['channel_mlp.fc2']
+        channel_mlp_fc1_bias_mask = global_masks[i]['channel_mlp.fc1_bias'] 
 
         # === Aktív neuronindexek (megőrizzük sorrendet) ===
         token_mlp_fc1_rows = (token_mlp_fc1_mask.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
@@ -245,11 +257,17 @@ def build_fully_pruned_mixer_model(model, global_masks):
         with torch.no_grad():
             # TOKEN MLP
             new_block.token_mlp.fc1.weight.copy_(block.token_mlp.fc1.weight[token_mlp_fc1_rows])
+            new_block.token_mlp.fc1.bias.copy_(block.token_mlp.fc1.bias[token_mlp_fc1_rows])
+            
             new_block.token_mlp.fc2.weight.copy_(block.token_mlp.fc2.weight[:, token_mlp_fc1_rows])
+            new_block.token_mlp.fc2.bias.copy_(block.token_mlp.fc2.bias)
 
             # CHANNEL MLP
             new_block.channel_mlp.fc1.weight.copy_(block.channel_mlp.fc1.weight[channel_mlp_fc1_rows])
+            new_block.channel_mlp.fc1.bias.copy_(block.channel_mlp.fc1.bias[channel_mlp_fc1_rows])
+            
             new_block.channel_mlp.fc2.weight.copy_(block.channel_mlp.fc2.weight[:, channel_mlp_fc1_rows])
+            new_block.channel_mlp.fc2.bias.copy_(np.block.channel_mlp.fc2.bias)
 
         new_block.norm1.load_state_dict(block.norm1.state_dict())
         new_block.norm2.load_state_dict(block.norm2.state_dict())
@@ -284,8 +302,13 @@ def lottery_ticket_mixer_cycle(prune_steps=9, relative_margin=0.15):
     for block in model.mixer_blocks:
         m = {
             'token_mlp.fc1': torch.ones_like(block.token_mlp.fc1.weight),
+            'token_mlp.fc1.bias': torch.ones_like(block.token_mlp.fc1.bias),
+            
             'token_mlp.fc2': torch.ones_like(block.token_mlp.fc2.weight),
+
             'channel_mlp.fc1': torch.ones_like(block.channel_mlp.fc1.weight),
+            'channel_mlp.fc1.bias': torch.ones_like(block.channel_mlp.fc1.bias),
+            
             'channel_mlp.fc2': torch.ones_like(block.channel_mlp.fc2.weight),
         }
         global_masks.append(m)
@@ -301,8 +324,13 @@ def lottery_ticket_mixer_cycle(prune_steps=9, relative_margin=0.15):
         with torch.no_grad():
             for i, block in enumerate(model.mixer_blocks):
                 block.token_mlp.fc1.weight *= global_masks[i]['token_mlp.fc1'].to(device)
+                block.token_mlp.fc1.bias *= global_masks[i]['token_mlp.fc1.bias'].to(device)
+                
                 block.token_mlp.fc2.weight *= global_masks[i]['token_mlp.fc2'].to(device)
+                
                 block.channel_mlp.fc1.weight *= global_masks[i]['channel_mlp.fc1'].to(device)
+                block.channel_mlp.fc1.bias *= global_masks[i]['channel_mlp.fc1.bias'].to(device)
+                
                 block.channel_mlp.fc2.weight *= global_masks[i]['channel_mlp.fc2'].to(device)
 
         for epoch in range(5):
