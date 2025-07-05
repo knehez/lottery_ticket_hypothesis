@@ -262,9 +262,6 @@ def lottery_ticket_cycle(device, prune_steps=7):
             total = weight.numel()
             print(f"[Pruning Info] {lname} nullázott súlyok: {num_zero}/{total} ({100.0 * num_zero / total:.2f}%)")
 
-        # Save masked model weights for next round
-        initial_state = copy.deepcopy(model.state_dict())
-
 # === Futtatás ===
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 lottery_ticket_cycle(device)
