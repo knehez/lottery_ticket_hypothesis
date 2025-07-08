@@ -24,7 +24,7 @@ class MLP(nn.Module):
 class MixerBlock(nn.Module):
     def __init__(self, num_patches, dim,
                  token_dim, token_out_dim,
-                 channel_in_dim, channel_dim, channel_out_dim):
+                 channel_dim, channel_out_dim):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.token_mlp = MLP(
@@ -34,27 +34,27 @@ class MixerBlock(nn.Module):
         )
         self.token_proj = nn.Linear(token_out_dim, num_patches) if token_out_dim != num_patches else nn.Identity()
         self.norm2 = nn.LayerNorm(dim)
-        
-        self.channel_in_proj = nn.Linear(dim, channel_in_dim) if channel_in_dim != dim else nn.Identity()
         self.channel_mlp = MLP(
-            in_features=channel_in_dim,   # <<< Itt is változik
+            in_features=dim,
             hidden_dim=channel_dim,
             out_features=channel_out_dim
         )
-        self.channel_proj = nn.Linear(channel_out_dim, dim) if channel_out_dim != dim else nn.Identity()
+        self.channel_out_proj = nn.Linear(channel_out_dim, dim) if channel_out_dim != dim else nn.Identity()
 
     def forward(self, x):
-        y = self.norm1(x).transpose(1, 2)
-        token_out = self.token_mlp(y)
-        token_out = self.token_proj(token_out).transpose(1, 2)
-        x = x + token_out
-        # ÚJ: channel_in_proj
-        x_in = self.channel_in_proj(self.norm2(x))
-        channel_out = self.channel_mlp(x_in)
-        channel_out = self.channel_proj(channel_out)
-        x = x + channel_out
-        return x
+        # x: [B, N, D]
+        y = self.norm1(x).transpose(1, 2)               # [B, D, N]
+        token_out = self.token_mlp(y)   # [B, N, token_out_dim]
+        #print(f"[MixerBlock] x: {x.shape}, y: {y.shape}, token_out: {token_out.shape}, token_proj: {self.token_proj}")
+    
+        token_out = self.token_proj(token_out).transpose(1, 2)           # [B, N, D]
+        #print(f"[MixerBlock] token_out (after proj): {token_out.shape}")
+        x = x + token_out                               # residual
 
+        channel_out = self.channel_mlp(self.norm2(x))   # [B, N, channel_out_dim]
+        channel_out = self.channel_out_proj(channel_out)     # [B, N, D]
+        x = x + channel_out                             # residual
+        return x
 
 class MLPMixer(nn.Module):
     def __init__(
@@ -66,7 +66,7 @@ class MLPMixer(nn.Module):
         depth=8,
         token_dim=64,
         channel_dim=768,
-        mixer_block_dims=None,
+        mixer_block_dims=None,  # Ha None, akkor automatikusan létrejön!
     ):
         super().__init__()
         patch_dim = patch_size * patch_size * in_channels
@@ -75,11 +75,11 @@ class MLPMixer(nn.Module):
 
         self.embedding = nn.Linear(patch_dim, embedding_dim)
 
+        # Ha nincs pruned architektúra, klasszikusat készít
         if mixer_block_dims is None:
-            num_patches = (32 // patch_size) ** 2
+            num_patches = (32 // patch_size) ** 2  # vagy image_size paramétert is vehetsz fel, ha kell!
             mixer_block_dims = [
-                (num_patches, embedding_dim, token_dim, num_patches,
-                 embedding_dim, channel_dim, embedding_dim)
+                (num_patches, embedding_dim, token_dim, num_patches, channel_dim, embedding_dim)
                 for _ in range(depth)
             ]
 
@@ -89,9 +89,8 @@ class MLPMixer(nn.Module):
                 dim=cfg[1],
                 token_dim=cfg[2],
                 token_out_dim=cfg[3],
-                channel_in_dim=cfg[4],
-                channel_dim=cfg[5],
-                channel_out_dim=cfg[6]
+                channel_dim=cfg[4],
+                channel_out_dim=cfg[5]
             ) for cfg in mixer_block_dims
         ])
         self.norm = nn.LayerNorm(mixer_block_dims[-1][1])
@@ -108,7 +107,6 @@ class MLPMixer(nn.Module):
         x = self.norm(x)
         x = x.mean(dim=1)
         return self.classifier(x)
-
 
 # --- LTH components ---
 def train(model, optimizer, dataloader, device):
@@ -241,19 +239,8 @@ def prune_mixer_model(model, global_masks, relative_margin=0.15, verbose=True):
             global_mask=global_masks[i]['channel_mlp.fc1'],
             relative_margin=relative_margin,
             verbose=verbose,
-            layer_name=f"channel_mlp_fc1_block_{i}",
-            axis=0
+            layer_name=f"channel_mlp_fc1_block_{i}"
         )
-        
-        mask_channel_mlp_fc1 = correlation_mask(
-            block.channel_mlp.fc1.weight,
-            global_mask=global_masks[i]['channel_mlp.fc1'],
-            relative_margin=relative_margin,
-            verbose=verbose,
-            layer_name=f"channel_mlp_fc1_block_{i}",
-            axis=1
-        )
-        
         mask_channel_mlp_fc2 = global_masks[i]['channel_mlp.fc2'] * propagate_mask(mask_channel_mlp_fc1, block.channel_mlp.fc2.weight).to(device)
         
         mask_channel_mlp_fc2 = correlation_mask(
@@ -299,14 +286,15 @@ def prune_mixer_model(model, global_masks, relative_margin=0.15, verbose=True):
 def build_fully_pruned_mixer_model(model, global_masks):
     device = next(model.parameters()).device
     mixer_block_dims = []
-    # --- FONTOS: vezetjük az előző blokk aktív channel kimeneti indexeit is! ---
-    prev_channel_out_idx = None
+
     for i, block in enumerate(model.mixer_blocks):
+        # Maszkok, shape: [out, in]
         mask_token_fc1 = global_masks[i]['token_mlp.fc1']
         mask_token_fc2 = global_masks[i]['token_mlp.fc2']
         mask_channel_fc1 = global_masks[i]['channel_mlp.fc1']
         mask_channel_fc2 = global_masks[i]['channel_mlp.fc2']
 
+        # Megmaradt neuronok
         token_fc1_out = (mask_token_fc1.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
         token_fc2_out = (mask_token_fc2.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
         channel_fc1_out = (mask_channel_fc1.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
@@ -316,19 +304,11 @@ def build_fully_pruned_mixer_model(model, global_masks):
         dim = block.channel_mlp.fc1.in_features
         token_dim = len(token_fc1_out)
         token_out_dim = len(token_fc2_out)
-
-        # --- ÚJ: channel_in_dim = bemeneti neuronok száma ---
-        if prev_channel_out_idx is None:
-            channel_in_dim = dim
-        else:
-            channel_in_dim = len(prev_channel_out_idx)
         channel_dim = len(channel_fc1_out)
         channel_out_dim = len(channel_fc2_out)
 
-        mixer_block_dims.append((num_patches, dim, token_dim, token_out_dim, channel_in_dim, channel_dim, channel_out_dim))
-        prev_channel_out_idx = channel_fc2_out
-
-    # --- Új modellt készítünk ---
+        mixer_block_dims.append((num_patches, dim, token_dim, token_out_dim, channel_dim, channel_out_dim))
+        
     pruned_mixer = MLPMixer(
         patch_size=model.patch_size,
         in_channels=model.in_channels,
@@ -341,41 +321,23 @@ def build_fully_pruned_mixer_model(model, global_masks):
     pruned_mixer.norm.load_state_dict(model.norm.state_dict())
     pruned_mixer.classifier.load_state_dict(model.classifier.state_dict())
 
-    prev_channel_out_idx = None
     for i, block in enumerate(pruned_mixer.mixer_blocks):
         orig_block = model.mixer_blocks[i]
-        mask_token_fc1 = global_masks[i]['token_mlp.fc1']
-        mask_token_fc2 = global_masks[i]['token_mlp.fc2']
-        mask_channel_fc1 = global_masks[i]['channel_mlp.fc1']
-        mask_channel_fc2 = global_masks[i]['channel_mlp.fc2']
-
-        token_fc1_out = (mask_token_fc1.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
-        token_fc2_out = (mask_token_fc2.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
-        channel_fc1_out = (mask_channel_fc1.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
-        channel_fc2_out = (mask_channel_fc2.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
-
-        # --- TOKEN MLP weight másolás ---
         with torch.no_grad():
+            # Token MLP
+            token_fc1_out = (global_masks[i]['token_mlp.fc1'].sum(dim=1) > 0).nonzero(as_tuple=True)[0]
+            token_fc2_out = (global_masks[i]['token_mlp.fc2'].sum(dim=1) > 0).nonzero(as_tuple=True)[0]
+            # FC1 weight: [out, in], bias: [out]
             block.token_mlp.fc1.weight.copy_(orig_block.token_mlp.fc1.weight[token_fc1_out])
             block.token_mlp.fc1.bias.copy_(orig_block.token_mlp.fc1.bias[token_fc1_out])
+            # FC2 weight: [out, in], bias: [out]
             block.token_mlp.fc2.weight.copy_(orig_block.token_mlp.fc2.weight[token_fc2_out, :len(token_fc1_out)])
             block.token_mlp.fc2.bias.copy_(orig_block.token_mlp.fc2.bias[token_fc2_out])
 
-            # --- CHANNEL IN PROJ weight ---
-            if prev_channel_out_idx is None:
-                # Első blokk: Identity vagy Linear (de minden bemenet megmarad)
-                if isinstance(block.channel_in_proj, nn.Linear):
-                    block.channel_in_proj.weight.copy_(orig_block.channel_in_proj.weight)
-                    block.channel_in_proj.bias.copy_(orig_block.channel_in_proj.bias)
-            else:
-                if isinstance(block.channel_in_proj, nn.Linear):
-                    block.channel_in_proj.weight.copy_(
-                        orig_block.channel_in_proj.weight[:, prev_channel_out_idx]
-                    )
-                    block.channel_in_proj.bias.copy_(orig_block.channel_in_proj.bias)
-
-            # --- CHANNEL MLP weight ---
-            block.channel_mlp.fc1.weight.copy_(orig_block.channel_mlp.fc1.weight[channel_fc1_out, :block.channel_in_proj.out_features])
+            # Channel MLP
+            channel_fc1_out = (global_masks[i]['channel_mlp.fc1'].sum(dim=1) > 0).nonzero(as_tuple=True)[0]
+            channel_fc2_out = (global_masks[i]['channel_mlp.fc2'].sum(dim=1) > 0).nonzero(as_tuple=True)[0]
+            block.channel_mlp.fc1.weight.copy_(orig_block.channel_mlp.fc1.weight[channel_fc1_out])
             block.channel_mlp.fc1.bias.copy_(orig_block.channel_mlp.fc1.bias[channel_fc1_out])
             block.channel_mlp.fc2.weight.copy_(orig_block.channel_mlp.fc2.weight[channel_fc2_out, :len(channel_fc1_out)])
             block.channel_mlp.fc2.bias.copy_(orig_block.channel_mlp.fc2.bias[channel_fc2_out])
@@ -383,12 +345,9 @@ def build_fully_pruned_mixer_model(model, global_masks):
             block.norm1.load_state_dict(orig_block.norm1.state_dict())
             block.norm2.load_state_dict(orig_block.norm2.state_dict())
 
-        prev_channel_out_idx = channel_fc2_out
-
     print("Num of parameters in pruned model:", sum(p.numel() for p in pruned_mixer.parameters()))
     print("Num of parameters in original model:", sum(p.numel() for p in model.parameters()))
     return pruned_mixer
-
 
 
 
