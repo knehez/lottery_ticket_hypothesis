@@ -26,7 +26,7 @@ providers = [
     }),
     'CPUExecutionProvider'
 ]
-sess = ort.InferenceSession('pruned_model2.onnx', providers=providers)
+sess = ort.InferenceSession('pruned_model.onnx', providers=providers)
 input_name = sess.get_inputs()[0].name
 
 # Inference time mérés CIFAR-10 teszt batch-eken
