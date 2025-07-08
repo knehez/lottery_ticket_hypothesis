@@ -411,8 +411,18 @@ def lottery_ticket_mixer_cycle(prune_steps=12, relative_margin=0.15):
             torch.save(model.state_dict(), "original_mixer_model.pt")
             print("Final pruned Mixer model saved as 'mixer_pruned_model.pt'")
             pruned_mixer = build_fully_pruned_mixer_model(model, global_masks)
+            
+            # --- Finomhangolás (fine-tune) pruned_mixer-en ---
+            pruned_optimizer = torch.optim.Adam(pruned_mixer.parameters())
+            for epoch in range(5):
+                train(pruned_mixer, pruned_optimizer, train_loader, device)
+                acc, elapsed = test(pruned_mixer, test_loader, device)
+                print(f"[Fine-tune] Epoch {epoch + 1}: accuracy={acc:.4f} - {elapsed:.4f} seconds")
+            
+            # Mérés a végleges pruned modellen
             acc, elapsed = test(pruned_mixer, test_loader, device)
             print(f"[Eval] pruned modell - Inference time on test set: {elapsed:.4f} seconds - accuracy={acc:.4f}")
+            
             print(pruned_mixer)
             torch.save(pruned_mixer.state_dict(), "pruned_mixer_model.pt")
             dummy_input = torch.randn(1, 3, 32, 32).to(device)
