@@ -231,7 +231,17 @@ def prune_mixer_model(model, global_masks, relative_margin=0.15, verbose=True):
             global_mask=global_masks[i]['token_mlp.fc1'],
             relative_margin=relative_margin,
             verbose=verbose,
-            layer_name=f"token_mlp_fc1_block_{i}"
+            layer_name=f"token_mlp_fc1_block_{i}",
+            axis=0
+        )
+
+        mask_token_mlp_fc1 = correlation_mask(
+            block.token_mlp.fc1.weight,
+            global_mask=mask_token_mlp_fc1,
+            relative_margin=relative_margin,
+            verbose=verbose,
+            layer_name=f"token_mlp_fc1_block_{i}",
+            axis=1
         )
 
         # === TOKEN MLP FC2 input: fc1 output alapján prune ===
@@ -254,9 +264,19 @@ def prune_mixer_model(model, global_masks, relative_margin=0.15, verbose=True):
             global_mask=global_masks[i]['channel_mlp.fc1'],
             relative_margin=relative_margin,
             verbose=verbose,
-            layer_name=f"channel_mlp_fc1_block_{i}"
+            layer_name=f"channel_mlp_fc1_block_{i}",
+            axis=0
         )
         mask_channel_mlp_fc2 = global_masks[i]['channel_mlp.fc2'] * propagate_mask(mask_channel_mlp_fc1, block.channel_mlp.fc2.weight).to(device)
+        
+        mask_channel_mlp_fc1 = correlation_mask(
+            block.channel_mlp.fc1.weight,
+            global_mask=mask_channel_mlp_fc1,
+            relative_margin=relative_margin,
+            verbose=verbose,
+            layer_name=f"channel_mlp_fc1_block_{i}",
+            axis=1
+        )
         
         mask_channel_mlp_fc2 = correlation_mask(
             block.channel_mlp.fc2.weight,
@@ -301,46 +321,52 @@ def prune_mixer_model(model, global_masks, relative_margin=0.15, verbose=True):
 def build_fully_pruned_mixer_model(model, global_masks):
     device = next(model.parameters()).device
     mixer_block_dims = []
-    prev_token_out = None
-    prev_channel_out = None
+
+    # Kezdeti bemeneti dimenziók (pl. CIFAR10: 32x32 patch -> 16)
+    orig_num_patches = (32 // model.patch_size) ** 2
+    orig_embedding_dim = model.embedding.out_features
+
+    current_token_dim = orig_num_patches
+    current_channel_dim = orig_embedding_dim
 
     for i, block in enumerate(model.mixer_blocks):
-        # Maszkok, shape: [out, in]
+        # --- Token MLP pruning ---
         mask_token_fc1 = global_masks[i]['token_mlp.fc1']
         mask_token_fc2 = global_masks[i]['token_mlp.fc2']
-        mask_channel_fc1 = global_masks[i]['channel_mlp.fc1']
-        mask_channel_fc2 = global_masks[i]['channel_mlp.fc2']
-
-        # Megmaradt neuronok indexei
         token_fc1_in = (mask_token_fc1.sum(dim=0) > 0).nonzero(as_tuple=True)[0]
         token_fc1_out = (mask_token_fc1.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
         token_fc2_out = (mask_token_fc2.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
+
+        # --- Channel MLP pruning ---
+        mask_channel_fc1 = global_masks[i]['channel_mlp.fc1']
+        mask_channel_fc2 = global_masks[i]['channel_mlp.fc2']
         channel_fc1_in = (mask_channel_fc1.sum(dim=0) > 0).nonzero(as_tuple=True)[0]
         channel_fc1_out = (mask_channel_fc1.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
         channel_fc2_out = (mask_channel_fc2.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
 
-        # Alap arch dimenziók
-        num_patches = len(token_fc1_in)
-        dim = len(channel_fc1_in)
-        token_dim = len(token_fc1_out)
-        token_out_dim = len(token_fc2_out)
-        channel_dim = len(channel_fc1_out)
-        channel_out_dim = len(channel_fc2_out)
+        # Pruned MLP méretek
+        token_dim = len(token_fc1_out)        # token_mlp.fc1 out
+        token_out_dim = len(token_fc2_out)    # token_mlp.fc2 out
+        token_in_dim = current_token_dim      # residual miatt!
+        token_out_proj_dim = current_token_dim  # residual miatt!
 
-        # Projekciós rétegek dimenziói (pruning esetén)
-        token_in_dim = len(token_fc1_in)
-        token_out_proj_dim = num_patches  # végső cél a num_patches (ha nem változott, Identity lesz)
-        channel_in_dim = len(channel_fc1_in)
-        channel_out_proj_dim = dim        # végső cél a dim (ha nem változott, Identity lesz)
+        channel_dim = len(channel_fc1_out)        # channel_mlp.fc1 out
+        channel_out_dim = len(channel_fc2_out)    # channel_mlp.fc2 out
+        channel_in_dim = current_channel_dim      # residual miatt!
+        channel_out_proj_dim = current_channel_dim  # residual miatt!
 
+        # Block konfigurációk
         mixer_block_dims.append((
-            num_patches, dim, token_dim, token_out_dim,
+            token_in_dim,            # num_patches (block input token dim)
+            channel_in_dim,          # dim (block input channel dim)
+            token_dim, token_out_dim,
             channel_dim, channel_out_dim,
             token_in_dim, token_out_proj_dim,
             channel_in_dim, channel_out_proj_dim
         ))
 
-    # Modell létrehozása új dimenziókkal
+        # NEM változtatjuk current_token_dim/current_channel_dim, residual shape végig fix!
+
     pruned_mixer = MLPMixer(
         patch_size=model.patch_size,
         in_channels=model.in_channels,
@@ -353,47 +379,74 @@ def build_fully_pruned_mixer_model(model, global_masks):
     pruned_mixer.norm.load_state_dict(model.norm.state_dict())
     pruned_mixer.classifier.load_state_dict(model.classifier.state_dict())
 
-    # Súlymásolás blokkonként
+    # Súlyok másolása prunolt FC-kre!
     for i, block in enumerate(pruned_mixer.mixer_blocks):
         orig_block = model.mixer_blocks[i]
         with torch.no_grad():
-            # Token MLP pruning
+            # --- Token MLP ---
             mask_token_fc1 = global_masks[i]['token_mlp.fc1']
             mask_token_fc2 = global_masks[i]['token_mlp.fc2']
             token_fc1_in = (mask_token_fc1.sum(dim=0) > 0).nonzero(as_tuple=True)[0]
             token_fc1_out = (mask_token_fc1.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
             token_fc2_out = (mask_token_fc2.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
 
-            # FC1
-            block.token_mlp.fc1.weight.copy_(orig_block.token_mlp.fc1.weight[token_fc1_out][:, token_fc1_in])
+            # FC1 (pruned in-dim ellenőrzés)
+            orig_in_dim = orig_block.token_mlp.fc1.in_features
+            pruned_in_dim = block.token_mlp.fc1.in_features
+            if pruned_in_dim == len(token_fc1_in):
+                block.token_mlp.fc1.weight.copy_(
+                    orig_block.token_mlp.fc1.weight[token_fc1_out][:, token_fc1_in]
+                )
+            else:
+                block.token_mlp.fc1.weight.copy_(
+                    orig_block.token_mlp.fc1.weight[token_fc1_out]
+                )
             block.token_mlp.fc1.bias.copy_(orig_block.token_mlp.fc1.bias[token_fc1_out])
-            # FC2
-            block.token_mlp.fc2.weight.copy_(orig_block.token_mlp.fc2.weight[token_fc2_out][:, token_fc1_out])
+
+            # FC2 (mindig out, in: az előző FC1 out-ja)
+            block.token_mlp.fc2.weight.copy_(
+                orig_block.token_mlp.fc2.weight[token_fc2_out][:, token_fc1_out]
+            )
             block.token_mlp.fc2.bias.copy_(orig_block.token_mlp.fc2.bias[token_fc2_out])
 
-            # Channel MLP pruning
+            # --- Channel MLP ---
             mask_channel_fc1 = global_masks[i]['channel_mlp.fc1']
             mask_channel_fc2 = global_masks[i]['channel_mlp.fc2']
             channel_fc1_in = (mask_channel_fc1.sum(dim=0) > 0).nonzero(as_tuple=True)[0]
             channel_fc1_out = (mask_channel_fc1.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
             channel_fc2_out = (mask_channel_fc2.sum(dim=1) > 0).nonzero(as_tuple=True)[0]
 
-            # FC1
-            block.channel_mlp.fc1.weight.copy_(orig_block.channel_mlp.fc1.weight[channel_fc1_out][:, channel_fc1_in])
+            # FC1 (pruned in-dim ellenőrzés)
+            orig_in_dim = orig_block.channel_mlp.fc1.in_features
+            pruned_in_dim = block.channel_mlp.fc1.in_features
+            if pruned_in_dim == len(channel_fc1_in):
+                block.channel_mlp.fc1.weight.copy_(
+                    orig_block.channel_mlp.fc1.weight[channel_fc1_out][:, channel_fc1_in]
+                )
+            else:
+                block.channel_mlp.fc1.weight.copy_(
+                    orig_block.channel_mlp.fc1.weight[channel_fc1_out]
+                )
             block.channel_mlp.fc1.bias.copy_(orig_block.channel_mlp.fc1.bias[channel_fc1_out])
-            # FC2
-            block.channel_mlp.fc2.weight.copy_(orig_block.channel_mlp.fc2.weight[channel_fc2_out][:, channel_fc1_out])
+
+            # FC2 (mindig out, in: az előző FC1 out-ja)
+            block.channel_mlp.fc2.weight.copy_(
+                orig_block.channel_mlp.fc2.weight[channel_fc2_out][:, channel_fc1_out]
+            )
             block.channel_mlp.fc2.bias.copy_(orig_block.channel_mlp.fc2.bias[channel_fc2_out])
 
+            # Norm rétegek
             block.norm1.load_state_dict(orig_block.norm1.state_dict())
             block.norm2.load_state_dict(orig_block.norm2.state_dict())
+            # Projekciós layereket nem kell másolni, random marad!
 
     print("Num of parameters in pruned model:", sum(p.numel() for p in pruned_mixer.parameters()))
     print("Num of parameters in original model:", sum(p.numel() for p in model.parameters()))
     return pruned_mixer
 
 
-def lottery_ticket_mixer_cycle(prune_steps=12, relative_margin=0.15):
+
+def lottery_ticket_mixer_cycle(prune_steps=7, relative_margin=0.15):
     # --- Data ---
     transform = transforms.ToTensor()
     train_loader = DataLoader(datasets.CIFAR10('.', train=True, download=True, transform=transform),
@@ -449,14 +502,14 @@ def lottery_ticket_mixer_cycle(prune_steps=12, relative_margin=0.15):
             print(f"Epoch {epoch + 1}: accuracy={acc:.4f} - {elapsed:.4f} seconds")
 
         # Mentés az utolsó iterációban
-        if True:
+        if step == prune_steps - 1:
             torch.save(model.state_dict(), "original_mixer_model.pt")
             print("Final pruned Mixer model saved as 'mixer_pruned_model.pt'")
             pruned_mixer = build_fully_pruned_mixer_model(model, global_masks)
-            
+            print(pruned_mixer)
             # --- Finomhangolás (fine-tune) pruned_mixer-en ---
             pruned_optimizer = torch.optim.Adam(pruned_mixer.parameters())
-            for epoch in range(1):
+            for epoch in range(5):
                 train(pruned_mixer, pruned_optimizer, train_loader, device)
                 acc, elapsed = test(pruned_mixer, test_loader, device)
                 print(f"[Fine-tune] Epoch {epoch + 1}: accuracy={acc:.4f} - {elapsed:.4f} seconds")
@@ -464,8 +517,6 @@ def lottery_ticket_mixer_cycle(prune_steps=12, relative_margin=0.15):
             # Mérés a végleges pruned modellen
             acc, elapsed = test(pruned_mixer, test_loader, device)
             print(f"[Eval] pruned modell - Inference time on test set: {elapsed:.4f} seconds - accuracy={acc:.4f}")
-            
-            print(pruned_mixer)
             torch.save(pruned_mixer.state_dict(), "pruned_mixer_model.pt")
             dummy_input = torch.randn(1, 3, 32, 32).to(device)
             # ONNX exportálás
@@ -478,7 +529,7 @@ def lottery_ticket_mixer_cycle(prune_steps=12, relative_margin=0.15):
                 dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
                 opset_version=20
             )
-            #break
+            break
 
         # Új maszkolás
         global_masks = prune_mixer_model(model, global_masks, relative_margin=relative_margin)
