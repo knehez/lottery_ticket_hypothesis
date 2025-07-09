@@ -496,7 +496,7 @@ def lottery_ticket_mixer_cycle(prune_steps=7, relative_margin=0.15):
                 
                 block.channel_mlp.fc2.weight *= global_masks[i]['channel_mlp.fc2'].to(device)
 
-        for epoch in range(3):
+        for epoch in range(8):
             train(model, optimizer, train_loader, device)
             acc, elapsed = test(model, test_loader, device)
             print(f"Epoch {epoch + 1}: accuracy={acc:.4f} - {elapsed:.4f} seconds")
@@ -509,7 +509,7 @@ def lottery_ticket_mixer_cycle(prune_steps=7, relative_margin=0.15):
             print(pruned_mixer)
             # --- Finomhangolás (fine-tune) pruned_mixer-en ---
             pruned_optimizer = torch.optim.Adam(pruned_mixer.parameters())
-            for epoch in range(5):
+            for epoch in range(10):
                 train(pruned_mixer, pruned_optimizer, train_loader, device)
                 acc, elapsed = test(pruned_mixer, test_loader, device)
                 print(f"[Fine-tune] Epoch {epoch + 1}: accuracy={acc:.4f} - {elapsed:.4f} seconds")
@@ -524,6 +524,15 @@ def lottery_ticket_mixer_cycle(prune_steps=7, relative_margin=0.15):
                 pruned_mixer,
                 dummy_input,
                 "pruned_model.onnx",
+                input_names=["input"],
+                output_names=["output"],
+                dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+                opset_version=20
+            )
+            torch.onnx.export(
+                model,
+                dummy_input,
+                "orig_model.onnx",
                 input_names=["input"],
                 output_names=["output"],
                 dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
